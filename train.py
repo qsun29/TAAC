@@ -38,6 +38,38 @@ def build_feature_specs(
     return specs
 
 
+def build_aligned_user_dense_map(
+    user_int_schema: FeatureSchema,
+    user_dense_schema: FeatureSchema,
+) -> Tuple[dict, List[int]]:
+    """Match same-fid user int/list features with aligned user dense arrays."""
+    dense_by_fid = {
+        fid: (offset, length) for fid, offset, length in user_dense_schema.entries
+    }
+    aligned_map = {}
+    used_dense_indices = set()
+
+    for int_idx, (fid, _, int_len) in enumerate(user_int_schema.entries):
+        dense_entry = dense_by_fid.get(fid)
+        if dense_entry is None:
+            continue
+        dense_offset, dense_len = dense_entry
+        if dense_len != int_len:
+            logging.warning(
+                "Skip aligned fusion for fid=%s because int_len=%s != dense_len=%s",
+                fid, int_len, dense_len,
+            )
+            continue
+        aligned_map[int_idx] = (dense_offset, dense_len)
+        used_dense_indices.update(range(dense_offset, dense_offset + dense_len))
+
+    keep_indices = [
+        idx for idx in range(user_dense_schema.total_dim)
+        if idx not in used_dense_indices
+    ]
+    return aligned_map, keep_indices
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PCVRHyFormer Training")
 
@@ -272,12 +304,32 @@ def main() -> None:
         pcvr_dataset.user_int_schema, pcvr_dataset.user_int_vocab_sizes)
     item_int_feature_specs = build_feature_specs(
         pcvr_dataset.item_int_schema, pcvr_dataset.item_int_vocab_sizes)
+    user_aligned_dense_map, user_dense_keep_indices = build_aligned_user_dense_map(
+        pcvr_dataset.user_int_schema,
+        pcvr_dataset.user_dense_schema,
+    )
+    aligned_user_fids = [
+        pcvr_dataset.user_int_schema.entries[idx][0]
+        for idx in sorted(user_aligned_dense_map.keys())
+    ]
+    logging.info(
+        "Aligned user int/dense fusion enabled for %d feature(s): %s",
+        len(aligned_user_fids),
+        aligned_user_fids,
+    )
+    logging.info(
+        "Standalone user dense token keeps %d / %d dims after removing aligned stats",
+        len(user_dense_keep_indices),
+        pcvr_dataset.user_dense_schema.total_dim,
+    )
 
     model_args = {
         "user_int_feature_specs": user_int_feature_specs,
         "item_int_feature_specs": item_int_feature_specs,
         "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
+        "user_aligned_dense_map": user_aligned_dense_map,
+        "user_dense_keep_indices": user_dense_keep_indices,
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
         "user_ns_groups": user_ns_groups,
         "item_ns_groups": item_ns_groups,

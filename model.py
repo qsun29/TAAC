@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, NamedTuple, Tuple, Optional, Union
+from typing import Dict, List, NamedTuple, Tuple, Optional, Union
 
 
 class ModelInput(NamedTuple):
@@ -995,12 +995,14 @@ class GroupNSTokenizer(nn.Module):
 
     def __init__(self, feature_specs: List[Tuple[int, int, int]],
                  groups: List[List[int]], emb_dim: int, d_model: int,
-                 emb_skip_threshold: int = 0) -> None:
+                 emb_skip_threshold: int = 0,
+                 aligned_float_map: Optional[Dict[int, Tuple[int, int]]] = None) -> None:
         super().__init__()
         self.feature_specs = feature_specs
         self.groups = groups
         self.emb_dim = emb_dim
         self.emb_skip_threshold = emb_skip_threshold
+        self.aligned_float_map = aligned_float_map or {}
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
@@ -1031,11 +1033,53 @@ class GroupNSTokenizer(nn.Module):
             for group in groups
         ])
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+        if self.aligned_float_map:
+            self.aligned_dense_gate = nn.Linear(1, emb_dim)
+
+    def _embed_feature(
+        self,
+        int_feats: torch.Tensor,
+        dense_feats: Optional[torch.Tensor],
+        fid_idx: int,
+    ) -> torch.Tensor:
+        _, offset, length = self.feature_specs[fid_idx]
+        emb_real_idx = self._emb_index[fid_idx]
+        if emb_real_idx == -1:
+            return torch.zeros(
+                int_feats.shape[0], self.emb_dim,
+                device=int_feats.device, dtype=torch.float32,
+            )
+
+        emb_layer = self.embs[emb_real_idx]
+        vals = int_feats[:, offset:offset + length].long()
+        emb_all = emb_layer(vals)
+
+        if dense_feats is not None and fid_idx in self.aligned_float_map:
+            dense_offset, dense_len = self.aligned_float_map[fid_idx]
+            dense_vals = dense_feats[:, dense_offset:dense_offset + dense_len]
+            dense_vals = dense_vals[:, :length].unsqueeze(-1)
+            gate = torch.sigmoid(
+                self.aligned_dense_gate(torch.tanh(dense_vals))
+            )
+            emb_all = emb_all * (1.0 + gate)
+
+        if length == 1:
+            return emb_all[:, 0, :]
+
+        mask = (vals != 0).float().unsqueeze(-1)
+        count = mask.sum(dim=1).clamp(min=1)
+        return (emb_all * mask).sum(dim=1) / count
+
+    def forward(
+        self,
+        int_feats: torch.Tensor,
+        dense_feats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Embeds and projects grouped discrete features into NS tokens.
 
         Args:
             int_feats: (B, total_int_dim), concatenated integer features.
+            dense_feats: optional aligned dense arrays for same-fid user features.
 
         Returns:
             Tokens of shape (B, num_groups, D).
@@ -1044,24 +1088,7 @@ class GroupNSTokenizer(nn.Module):
         for group, proj in zip(self.groups, self.group_projs):
             fid_embs = []
             for fid_idx in group:
-                vs, offset, length = self.feature_specs[fid_idx]
-                emb_real_idx = self._emb_index[fid_idx]
-                if emb_real_idx == -1:
-                    # Filtered high-cardinality feature: output zero vector
-                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
-                else:
-                    emb_layer = self.embs[emb_real_idx]
-                    if length == 1:
-                        # Single-value feature: direct lookup
-                        fid_emb = emb_layer(int_feats[:, offset].long())  # (B, emb_dim)
-                    else:
-                        # Multi-value feature: lookup then mean pooling (ignoring padding=0)
-                        vals = int_feats[:, offset:offset + length].long()  # (B, length)
-                        emb_all = emb_layer(vals)  # (B, length, emb_dim)
-                        mask = (vals != 0).float().unsqueeze(-1)  # (B, length, 1)
-                        count = mask.sum(dim=1).clamp(min=1)  # (B, 1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count  # (B, emb_dim)
-                fid_embs.append(fid_emb)
+                fid_embs.append(self._embed_feature(int_feats, dense_feats, fid_idx))
             cat_emb = torch.cat(fid_embs, dim=-1)  # (B, num_fids*emb_dim)
             tokens.append(F.silu(proj(cat_emb)).unsqueeze(1))  # (B, 1, D)
         return torch.cat(tokens, dim=1)  # (B, num_groups, D)
@@ -1083,6 +1110,7 @@ class RankMixerNSTokenizer(nn.Module):
         d_model: int,
         num_ns_tokens: int,
         emb_skip_threshold: int = 0,
+        aligned_float_map: Optional[Dict[int, Tuple[int, int]]] = None,
     ) -> None:
         """Initializes RankMixerNSTokenizer.
 
@@ -1100,6 +1128,7 @@ class RankMixerNSTokenizer(nn.Module):
         self.emb_dim = emb_dim
         self.num_ns_tokens = num_ns_tokens
         self.emb_skip_threshold = emb_skip_threshold
+        self.aligned_float_map = aligned_float_map or {}
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
@@ -1139,17 +1168,59 @@ class RankMixerNSTokenizer(nn.Module):
             for _ in range(num_ns_tokens)
         ])
 
+        if self.aligned_float_map:
+            self.aligned_dense_gate = nn.Linear(1, emb_dim)
+
         logging.info(
             f"RankMixerNSTokenizer: {total_num_fids} fids, "
             f"total_emb_dim={total_emb_dim}, chunk_dim={self.chunk_dim}, "
             f"num_ns_tokens={num_ns_tokens}, pad={self._pad_size}"
         )
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+    def _embed_feature(
+        self,
+        int_feats: torch.Tensor,
+        dense_feats: Optional[torch.Tensor],
+        fid_idx: int,
+    ) -> torch.Tensor:
+        _, offset, length = self.feature_specs[fid_idx]
+        emb_real_idx = self._emb_index[fid_idx]
+        if emb_real_idx == -1:
+            return torch.zeros(
+                int_feats.shape[0], self.emb_dim,
+                device=int_feats.device, dtype=torch.float32,
+            )
+
+        emb_layer = self.embs[emb_real_idx]
+        vals = int_feats[:, offset:offset + length].long()
+        emb_all = emb_layer(vals)
+
+        if dense_feats is not None and fid_idx in self.aligned_float_map:
+            dense_offset, dense_len = self.aligned_float_map[fid_idx]
+            dense_vals = dense_feats[:, dense_offset:dense_offset + dense_len]
+            dense_vals = dense_vals[:, :length].unsqueeze(-1)
+            gate = torch.sigmoid(
+                self.aligned_dense_gate(torch.tanh(dense_vals))
+            )
+            emb_all = emb_all * (1.0 + gate)
+
+        if length == 1:
+            return emb_all[:, 0, :]
+
+        mask = (vals != 0).float().unsqueeze(-1)
+        count = mask.sum(dim=1).clamp(min=1)
+        return (emb_all * mask).sum(dim=1) / count
+
+    def forward(
+        self,
+        int_feats: torch.Tensor,
+        dense_feats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Embeds all features, concatenates, splits, and projects.
 
         Args:
             int_feats: (B, total_int_dim) concatenated integer features.
+            dense_feats: optional aligned dense arrays for same-fid user features.
 
         Returns:
             (B, num_ns_tokens, d_model) tensor.
@@ -1158,21 +1229,7 @@ class RankMixerNSTokenizer(nn.Module):
         all_embs = []
         for group in self.groups:
             for fid_idx in group:
-                vs, offset, length = self.feature_specs[fid_idx]
-                emb_real_idx = self._emb_index[fid_idx]
-                if emb_real_idx == -1:
-                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
-                else:
-                    emb_layer = self.embs[emb_real_idx]
-                    if length == 1:
-                        fid_emb = emb_layer(int_feats[:, offset].long())
-                    else:
-                        vals = int_feats[:, offset:offset + length].long()
-                        emb_all = emb_layer(vals)
-                        mask = (vals != 0).float().unsqueeze(-1)
-                        count = mask.sum(dim=1).clamp(min=1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count
-                all_embs.append(fid_emb)
+                all_embs.append(self._embed_feature(int_feats, dense_feats, fid_idx))
 
         cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
 
@@ -1207,6 +1264,8 @@ class PCVRHyFormer(nn.Module):
         # NS grouping config (grouped by fid index)
         user_ns_groups: List[List[int]],
         item_ns_groups: List[List[int]],
+        user_aligned_dense_map: Optional[Dict[int, Tuple[int, int]]] = None,
+        user_dense_keep_indices: Optional[List[int]] = None,
         # Model hyperparameters
         d_model: int = 64,
         emb_dim: int = 64,
@@ -1244,6 +1303,18 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.user_aligned_dense_map = user_aligned_dense_map or {}
+        if user_dense_keep_indices is None:
+            user_dense_keep_indices = list(range(user_dense_dim))
+        self.user_dense_keep_indices = user_dense_keep_indices
+        if len(user_dense_keep_indices) > 0:
+            self.register_buffer(
+                '_user_dense_keep_idx',
+                torch.tensor(user_dense_keep_indices, dtype=torch.long),
+                persistent=False,
+            )
+        else:
+            self._user_dense_keep_idx = None
 
         # ================== NS Tokens Construction ==================
 
@@ -1255,6 +1326,7 @@ class PCVRHyFormer(nn.Module):
                 emb_dim=emb_dim,
                 d_model=d_model,
                 emb_skip_threshold=emb_skip_threshold,
+                aligned_float_map=self.user_aligned_dense_map,
             )
             num_user_ns = len(user_ns_groups)
 
@@ -1280,6 +1352,7 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=user_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                aligned_float_map=self.user_aligned_dense_map,
             )
             num_user_ns = user_ns_tokens
 
@@ -1296,10 +1369,11 @@ class PCVRHyFormer(nn.Module):
             raise ValueError(f"Unknown ns_tokenizer_type: {ns_tokenizer_type}")
 
         # User dense feature projection (if available)
-        self.has_user_dense = user_dense_dim > 0
+        effective_user_dense_dim = len(self.user_dense_keep_indices)
+        self.has_user_dense = effective_user_dense_dim > 0
         if self.has_user_dense:
             self.user_dense_proj = nn.Sequential(
-                nn.Linear(user_dense_dim, d_model),
+                nn.Linear(effective_user_dense_dim, d_model),
                 nn.LayerNorm(d_model),
             )
 
@@ -1466,6 +1540,12 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
+
+    def _select_global_user_dense(self, user_dense_feats: torch.Tensor) -> torch.Tensor:
+        """Keep only dense dims not already consumed by aligned same-fid fusion."""
+        if self._user_dense_keep_idx is None:
+            return user_dense_feats[:, :0]
+        return user_dense_feats.index_select(1, self._user_dense_keep_idx)
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1634,12 +1714,14 @@ class PCVRHyFormer(nn.Module):
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
+        user_ns = self.user_ns_tokenizer(
+            inputs.user_int_feats, inputs.user_dense_feats)   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
+            global_user_dense = self._select_global_user_dense(inputs.user_dense_feats)
+            user_dense_tok = F.silu(self.user_dense_proj(global_user_dense)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
@@ -1677,12 +1759,14 @@ class PCVRHyFormer(nn.Module):
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
         # Reuses forward logic but without dropout
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
+        user_ns = self.user_ns_tokenizer(
+            inputs.user_int_feats, inputs.user_dense_feats)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
+            global_user_dense = self._select_global_user_dense(inputs.user_dense_feats)
+            user_dense_tok = F.silu(self.user_dense_proj(global_user_dense)).unsqueeze(1)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
