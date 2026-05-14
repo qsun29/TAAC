@@ -13,6 +13,7 @@ class ModelInput(NamedTuple):
     item_int_feats: torch.Tensor
     user_dense_feats: torch.Tensor
     item_dense_feats: torch.Tensor
+    timestamp: torch.Tensor
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
@@ -1246,6 +1247,34 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class SampleTimeEncoder(nn.Module):
+    """Encodes request timestamp without increasing the unified token count."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.hour_emb = nn.Embedding(24, d_model)
+        self.weekday_emb = nn.Embedding(7, d_model)
+        self.quarter_hour_emb = nn.Embedding(96, d_model)
+        self.proj = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(self, timestamp: torch.Tensor) -> torch.Tensor:
+        ts = timestamp.long().clamp(min=0)
+        hour = (ts // 3600) % 24
+        weekday = (ts // 86400 + 3) % 7  # Unix epoch 1970-01-01 was Thursday.
+        quarter_hour = (ts // 900) % 96
+        x = (
+            self.hour_emb(hour)
+            + self.weekday_emb(weekday)
+            + self.quarter_hour_emb(quarter_hour)
+        )
+        return self.proj(x)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1385,6 +1414,8 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
+        self.sample_time_encoder = SampleTimeEncoder(d_model)
+
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0))
@@ -1491,6 +1522,11 @@ class PCVRHyFormer(nn.Module):
             nn.Linear(num_queries * self.num_sequences * d_model, d_model),
             nn.LayerNorm(d_model),
         )
+        self.ns_output_proj = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.SiLU(),
+        )
 
         # Dropout
         self.emb_dropout = nn.Dropout(dropout_rate)
@@ -1541,11 +1577,38 @@ class PCVRHyFormer(nn.Module):
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
 
+        for emb in [
+            self.sample_time_encoder.hour_emb,
+            self.sample_time_encoder.weekday_emb,
+            self.sample_time_encoder.quarter_hour_emb,
+        ]:
+            nn.init.xavier_normal_(emb.weight.data)
+
     def _select_global_user_dense(self, user_dense_feats: torch.Tensor) -> torch.Tensor:
         """Keep only dense dims not already consumed by aligned same-fid fusion."""
         if self._user_dense_keep_idx is None:
             return user_dense_feats[:, :0]
         return user_dense_feats.index_select(1, self._user_dense_keep_idx)
+
+    def _build_ns_tokens(self, inputs: ModelInput) -> torch.Tensor:
+        """Build NS tokens and inject sample-level time context in-place."""
+        user_ns = self.user_ns_tokenizer(
+            inputs.user_int_feats, inputs.user_dense_feats)   # (B, num_user_groups, D)
+        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
+
+        ns_parts = [user_ns]
+        if self.has_user_dense:
+            global_user_dense = self._select_global_user_dense(inputs.user_dense_feats)
+            user_dense_tok = F.silu(self.user_dense_proj(global_user_dense)).unsqueeze(1)
+            ns_parts.append(user_dense_tok)
+        ns_parts.append(item_ns)
+        if self.has_item_dense:
+            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
+            ns_parts.append(item_dense_tok)
+
+        ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
+        time_context = self.sample_time_encoder(inputs.timestamp).unsqueeze(1)
+        return ns_tokens + time_context
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1708,27 +1771,15 @@ class PCVRHyFormer(nn.Module):
         all_q = torch.cat(curr_qs, dim=1)  # (B, Nq*S, D)
         output = all_q.view(B, -1)  # (B, Nq*S*D)
         output = self.output_proj(output)  # (B, D)
+        ns_summary = curr_ns.mean(dim=1)
+        output = self.ns_output_proj(torch.cat([output, ns_summary], dim=-1))
 
         return output
 
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
-        user_ns = self.user_ns_tokenizer(
-            inputs.user_int_feats, inputs.user_dense_feats)   # (B, num_user_groups, D)
-        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
-
-        ns_parts = [user_ns]
-        if self.has_user_dense:
-            global_user_dense = self._select_global_user_dense(inputs.user_dense_feats)
-            user_dense_tok = F.silu(self.user_dense_proj(global_user_dense)).unsqueeze(1)  # (B, 1, D)
-            ns_parts.append(user_dense_tok)
-        ns_parts.append(item_ns)
-        if self.has_item_dense:
-            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
-            ns_parts.append(item_dense_tok)
-
-        ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
+        ns_tokens = self._build_ns_tokens(inputs)
 
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
@@ -1759,21 +1810,7 @@ class PCVRHyFormer(nn.Module):
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
         # Reuses forward logic but without dropout
-        user_ns = self.user_ns_tokenizer(
-            inputs.user_int_feats, inputs.user_dense_feats)
-        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
-
-        ns_parts = [user_ns]
-        if self.has_user_dense:
-            global_user_dense = self._select_global_user_dense(inputs.user_dense_feats)
-            user_dense_tok = F.silu(self.user_dense_proj(global_user_dense)).unsqueeze(1)
-            ns_parts.append(user_dense_tok)
-        ns_parts.append(item_ns)
-        if self.has_item_dense:
-            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
-            ns_parts.append(item_dense_tok)
-
-        ns_tokens = torch.cat(ns_parts, dim=1)
+        ns_tokens = self._build_ns_tokens(inputs)
 
         seq_tokens_list = []
         seq_masks_list = []
